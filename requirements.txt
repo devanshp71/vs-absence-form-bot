@@ -1,1 +1,2 @@
-python-telegram-bot~=21.0
+# No third-party dependencies -- the bot uses only the Python standard library.
+# Kept as an empty manifest so the build system still detects a Python project.
