@@ -57,6 +57,8 @@ then reused; name is offered as a guess from their Telegram profile first
 ("We have you as X -- right?") so most people just tap Yes.
 """
 
+import calendar
+import datetime
 import hashlib
 import hmac
 import json
@@ -154,6 +156,9 @@ def get_user(chat_id) -> dict:
 def reset_answers(u: dict) -> None:
     u["step"] = "one_or_multiple"
     u["answers"] = {}
+    u.pop("_range_start", None)
+    u.pop("cal_year", None)
+    u.pop("cal_month", None)
 
 
 def has_profile(u: dict) -> bool:
@@ -219,6 +224,24 @@ def answer_callback(callback_id, text=None):
     call("answerCallbackQuery", payload)
 
 
+def edit_markup(chat_id, message_id, reply_markup):
+    call(
+        "editMessageReplyMarkup",
+        {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup},
+    )
+
+
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_markup": reply_markup if reply_markup is not None else {"inline_keyboard": []},
+    }
+    call("editMessageText", payload)
+
+
 def kb(rows):
     """rows: list of lists of (label, callback_data) tuples."""
     return {
@@ -238,6 +261,60 @@ def contact_kb():
 
 def remove_kb():
     return {"remove_keyboard": True}
+
+
+_WEEKDAY_HEADERS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def _fmt_date(d: "datetime.date") -> str:
+    return f"{d.month}/{d.day}/{d.year}"
+
+
+def _shift_month(year: int, month: int, delta: int):
+    idx = year * 12 + (month - 1) + delta
+    return idx // 12, idx % 12 + 1
+
+
+def build_calendar_kb(year: int, month: int, min_date: "datetime.date | None" = None):
+    """
+    Flight-picker-style date grid as an inline keyboard. Days before today
+    (or before min_date, for the "last day" of a range -- so you can't pick
+    an end date earlier than the start date) render as a disabled '·12'
+    label with a no-op callback; everything else is tappable.
+    """
+    weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(year, month)
+    today = datetime.date.today()
+    floor = max(today, min_date) if min_date else today
+
+    prev_y, prev_m = _shift_month(year, month, -1)
+    next_y, next_m = _shift_month(year, month, 1)
+    can_go_prev = (year, month) > (floor.year, floor.month)
+
+    rows = [
+        [
+            ("‹", f"cal:nav:{prev_y}-{prev_m:02d}") if can_go_prev else (" ", "cal:noop"),
+            (f"{_MONTH_NAMES[month - 1]} {year}", "cal:noop"),
+            ("›", f"cal:nav:{next_y}-{next_m:02d}"),
+        ],
+        [(w, "cal:noop") for w in _WEEKDAY_HEADERS],
+    ]
+    for week in weeks:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append((" ", "cal:noop"))
+                continue
+            d = datetime.date(year, month, day)
+            if d < floor:
+                row.append((f"·{day}", "cal:noop"))
+            else:
+                row.append((str(day), f"cal:pick:{d.isoformat()}"))
+        rows.append(row)
+    return kb(rows)
 
 
 # --------------------------------------------------------------------------
@@ -283,16 +360,40 @@ def ask_absence_start(chat_id):
     )
 
 
-def ask_single_day(chat_id):
-    send_message(chat_id, "Which day will you be away? (e.g. 9/1/2026)")
+def ask_single_day(chat_id, u):
+    today = datetime.date.today()
+    u["cal_year"], u["cal_month"] = today.year, today.month
+    send_message(
+        chat_id,
+        "Which day will you be away? Tap a date:",
+        build_calendar_kb(today.year, today.month),
+    )
 
 
-def ask_first_day(chat_id):
-    send_message(chat_id, "What's the first day you'll be away? (e.g. 9/1/2026)")
+def ask_first_day(chat_id, u):
+    today = datetime.date.today()
+    u["cal_year"], u["cal_month"] = today.year, today.month
+    u.pop("_range_start", None)
+    send_message(
+        chat_id,
+        "What's the first day you'll be away? Tap a date:",
+        build_calendar_kb(today.year, today.month),
+    )
 
 
-def ask_last_day(chat_id):
-    send_message(chat_id, "And the last day? (e.g. 9/5/2026)")
+def ask_last_day(chat_id, u, min_date=None):
+    if min_date:
+        year, month = min_date.year, min_date.month
+    else:
+        today = datetime.date.today()
+        year, month = today.year, today.month
+    u["cal_year"], u["cal_month"] = year, month
+    label = f" (on or after {_fmt_date(min_date)})" if min_date else ""
+    send_message(
+        chat_id,
+        f"And the last day?{label} Tap a date:",
+        build_calendar_kb(year, month, min_date=min_date),
+    )
 
 
 def ask_part_of_day(chat_id):
@@ -513,7 +614,7 @@ def handle_text(chat_id, u, text, from_user):
     if step == "first_day":
         u["answers"]["first_day"] = text.strip()
         u["step"] = "last_day"
-        ask_last_day(chat_id)
+        ask_last_day(chat_id, u)
         return
     if step == "last_day":
         # The live form only asks "Part of day" on the single-day branch --
@@ -552,7 +653,7 @@ def handle_contact(chat_id, u, contact):
     ask_side(chat_id)
 
 
-def handle_callback(chat_id, u, data, from_user):
+def handle_callback(chat_id, u, data, from_user, message_id=None):
     kind, _, value = data.partition(":")
 
     if kind == "side":
@@ -583,10 +684,67 @@ def handle_callback(chat_id, u, data, from_user):
         u["answers"]["one_or_multiple"] = "Just one day" if value == "one" else "Multiple days"
         if value == "one":
             u["step"] = "single_day"
-            ask_single_day(chat_id)
+            ask_single_day(chat_id, u)
         else:
             u["step"] = "first_day"
-            ask_first_day(chat_id)
+            ask_first_day(chat_id, u)
+        return
+
+    if kind == "cal":
+        # Flight-picker-style date selection. "nav" re-renders the same
+        # message's keyboard on a new month; "pick" records a date and,
+        # for a range, walks straight into picking the end date in the
+        # SAME message rather than sending a new one.
+        sub, _, val = value.partition(":")
+        if sub == "noop":
+            return
+        if sub == "nav":
+            y_str, m_str = val.split("-")
+            year, month = int(y_str), int(m_str)
+            u["cal_year"], u["cal_month"] = year, month
+            min_date = u.get("_range_start") if u.get("step") == "last_day" else None
+            if message_id:
+                edit_markup(chat_id, message_id, build_calendar_kb(year, month, min_date=min_date))
+            return
+        if sub == "pick":
+            picked = datetime.date.fromisoformat(val)
+            step = u.get("step")
+            if step == "single_day":
+                u["answers"]["single_day"] = _fmt_date(picked)
+                if message_id:
+                    edit_message(chat_id, message_id, f"📅 Away on <b>{_fmt_date(picked)}</b>")
+                u["step"] = "part_of_day"
+                ask_part_of_day(chat_id)
+                return
+            if step == "first_day":
+                u["_range_start"] = picked
+                u["answers"]["first_day"] = _fmt_date(picked)
+                u["step"] = "last_day"
+                u["cal_year"], u["cal_month"] = picked.year, picked.month
+                if message_id:
+                    edit_message(
+                        chat_id,
+                        message_id,
+                        f"First day: <b>{_fmt_date(picked)}</b>\nNow tap your last day:",
+                        build_calendar_kb(picked.year, picked.month, min_date=picked),
+                    )
+                else:
+                    ask_last_day(chat_id, u, min_date=picked)
+                return
+            if step == "last_day":
+                start = u.get("_range_start")
+                if start and picked < start:
+                    return
+                u["answers"]["last_day"] = _fmt_date(picked)
+                u["answers"]["part_of_day"] = ""
+                if message_id:
+                    label = f"{_fmt_date(start)} to {_fmt_date(picked)}" if start else _fmt_date(picked)
+                    edit_message(chat_id, message_id, f"📅 Away <b>{label}</b>")
+                u.pop("_range_start", None)
+                u["step"] = "reason"
+                ask_reason(chat_id)
+                return
+            return
         return
 
     if kind == "part":
@@ -622,9 +780,10 @@ def process_update(update: dict):
     if "callback_query" in update:
         cq = update["callback_query"]
         chat_id = cq["message"]["chat"]["id"]
+        message_id = cq["message"].get("message_id")
         u = get_user(chat_id)
         answer_callback(cq["id"])
-        handle_callback(chat_id, u, cq.get("data", ""), cq.get("from", {}))
+        handle_callback(chat_id, u, cq.get("data", ""), cq.get("from", {}), message_id)
         return
 
     message = update.get("message")
@@ -705,5 +864,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# redeploy trigger 2026-08-16
