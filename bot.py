@@ -38,14 +38,17 @@ deployed right now without blocking on that follow-up step.
 
 WHAT IS REMEMBERED, AND WHAT ISN'T
 -----------------------------------
-Phone, side, and name are remembered per Telegram user for as long as this
-process stays warm. Railway's free tier puts the container to sleep when
-idle and it can lose in-memory state on a cold start -- worst case, a
-volunteer is asked their phone/side/name again after a long gap. Nothing
-is lost or corrupted by that; it's just an extra question. If that turns
-out to be annoying in practice, the fix is a few lines writing this same
-dict to a small durable store -- flagged here rather than built now, since
-speed mattered more than that polish for the first version.
+Phone, side, name, and any in-progress absence report are kept in the
+`users` dict in memory AND mirrored to a JSON file on a mounted Railway
+Volume (see DATA_DIR below) after every update. Railway's free/hobby tier
+fully stops the container after a few minutes of no traffic and starts a
+fresh process on the next request -- that used to silently wipe `users`
+back to empty, which is exactly the bug reported 8/15/2026 (phone/name/
+side "not saving"). On startup the bot now reloads that JSON file first,
+so a volunteer's profile (and even a half-finished report) survives the
+container going to sleep and waking back up. If DATA_DIR isn't backed by
+a real Volume (e.g. running locally, or the Volume isn't attached), saving
+just fails silently and behavior falls back to the old memory-only mode.
 
 HOW IDENTITY WORKS
 -------------------
@@ -135,7 +138,7 @@ URL_PATH = "/tg/" + _derived("path-v2") if BOT_TOKEN else "/tg/unconfigured"
 SECRET_TOKEN = _derived("secret-v2") if BOT_TOKEN else ""
 
 # --------------------------------------------------------------------------
-# Per-user state (in-memory -- see module docstring for the trade-off)
+# Per-user state -- in memory, mirrored to disk (see module docstring)
 # --------------------------------------------------------------------------
 
 # users[chat_id] = {
@@ -146,6 +149,44 @@ SECRET_TOKEN = _derived("secret-v2") if BOT_TOKEN else ""
 # }
 users: dict = {}
 _lock = threading.Lock()
+
+# Mount a Railway Volume at this path and the JSON file below survives a
+# container restart/sleep-wake cycle. Without a Volume attached, DATA_DIR
+# just points at ordinary (ephemeral) container disk -- saving still works
+# for as long as that particular container is alive, but a fresh container
+# starts from an empty file again, same as the old memory-only behavior.
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+STATE_FILE = os.path.join(DATA_DIR, "users.json")
+
+
+def load_users() -> None:
+    global users
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        with _lock:
+            users = {int(k): v for k, v in raw.items()}
+        logger.info("Loaded %d saved user(s) from %s", len(users), STATE_FILE)
+    except FileNotFoundError:
+        logger.info("No saved state file at %s yet -- starting fresh.", STATE_FILE)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to load saved state from %s: %s", STATE_FILE, exc)
+
+
+def save_users() -> None:
+    """Best-effort, atomic (write-temp-then-rename) snapshot of `users` to
+    disk. Called after every update is processed. Never raises -- a save
+    failure should not take the bot down mid-conversation."""
+    try:
+        with _lock:
+            snapshot = json.dumps({str(k): v for k, v in users.items()})
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp_path = STATE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(snapshot)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to save state to %s: %s", STATE_FILE, exc)
 
 
 def get_user(chat_id) -> dict:
@@ -777,6 +818,17 @@ def handle_callback(chat_id, u, data, from_user, message_id=None):
 
 
 def process_update(update: dict):
+    try:
+        _dispatch_update(update)
+    finally:
+        # Persist after every update, whatever happened -- see DATA_DIR /
+        # load_users() / save_users() above. Cheap at this bot's traffic
+        # volume, and it's exactly what stops a container sleep/restart
+        # from losing phone/name/side or an in-progress report.
+        save_users()
+
+
+def _dispatch_update(update: dict):
     if "callback_query" in update:
         cq = update["callback_query"]
         chat_id = cq["message"]["chat"]["id"]
@@ -856,6 +908,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is not set.")
+    load_users()
     threading.Thread(target=ensure_webhook, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     logger.info("VS Absence bot v2 listening on port %s (webhook path %s)", PORT, URL_PATH)
