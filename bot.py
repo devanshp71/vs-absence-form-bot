@@ -558,7 +558,8 @@ def ask_time_text(chat_id):
 def ask_reason(chat_id):
     send_message(
         chat_id,
-        "Reason for the absence? (Optional -- tap Skip if you'd rather not say.)",
+        "Reason for the absence? (Optional -- <b>Type</b> it in below, or tap "
+        "Skip if you'd rather not say.)",
         kb([[("Skip", "reason:skip")]]),
     )
 
