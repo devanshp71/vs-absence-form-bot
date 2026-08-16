@@ -131,11 +131,27 @@ FORM_BASE_URL = (
 # Forms, question by question, and (2) a live flow run's raw trigger
 # output (Get_response_details), which showed every one of these IDs with
 # a real submitted value next to it. Not guessed.
+#
+# PHONE FIELD UPDATE (8/16/2026): volunteers reported phone number wasn't
+# showing up on the prefilled form. Root cause -- Microsoft Forms cannot
+# prefill a Number-type (or Number-restricted) question via URL params at
+# all, and "Phone number" had a Number restriction on it, so it was never
+# actually prefillable despite being in this dict. Fixed by removing the
+# Number restriction on the live form (now a plain Text question, still
+# required). That restriction toggle regenerates the question's internal
+# field ID, so the id below was updated to match. Before changing it,
+# checked the downstream impact: the production Power Automate flow
+# ("VS Absence UAT5 - MONTHLY") pulls phone via a hardcoded
+# body/<fieldId> reference in its "Run script" action's ScriptParameters,
+# and that reference already points at this same new id -- so no flow
+# edit was needed. Verified end to end: generated a fresh prefilled link
+# via Forms' own "Get Pre-filled URL" tool and confirmed the phone value
+# actually lands in the field on the response page.
 FIELD_IDS = {
     "side": "r5ac1c0153f1448d2b413d0eeada3707e",
     "first_name": "r14e0025bed3b401a88cfe69183b5f226",
     "last_name": "r20798edeb1a34ca3b118fec8580aa1fa",
-    "phone": "r3d424cccd9824ac7af4212498e59a73",
+    "phone": "r3d424cccd9824ac7af42124987e59a73",
     "one_or_multiple": "rece5a395a04143b0b25f0c1cad8159a8",
     "single_day": "r78b4d212a371440fbb6d259029ce4392",
     "first_day": "ra8b3f26882ee48c38d4ece35de5c45d7",
@@ -602,12 +618,10 @@ def build_prefill_url(u: dict) -> str:
         FIELD_IDS["side"]: _choice(SIDE_LABELS[u["side"]]),
         FIELD_IDS["first_name"]: u["first_name"],
         FIELD_IDS["last_name"]: u["last_name"],
-        # NOTE: Phone number is a "number"-type question. Confirmed
-        # 8/15/2026 that Microsoft Forms' own prefill tool does not
-        # generate a parameter for number-type questions at all -- it
-        # is simply not prefillable. Left out on purpose rather than
-        # included-and-silently-ignored; the volunteer types it once,
-        # same as today.
+        # Phone number: prefillable as of 8/16/2026 (see FIELD_IDS note
+        # above) now that the question is plain Text instead of
+        # Number-restricted.
+        FIELD_IDS["phone"]: u["phone"],
         FIELD_IDS["one_or_multiple"]: _choice(a["one_or_multiple"]),
     }
     if a["one_or_multiple"] == "Just one day":
@@ -636,9 +650,8 @@ def submit_mode_a(chat_id, u):
     link = build_prefill_url(u)
     send_message(
         chat_id,
-        "Everything's filled in except your phone number (Microsoft Forms "
-        "can't pre-fill that one) -- tap below, add your number, glance it "
-        "over, and hit <b>Submit</b>. That's it.\n\n"
+        "Everything's filled in -- tap below, glance it over, and hit "
+        "<b>Submit</b>. That's it.\n\n"
         f'<a href="{link}">Open the pre-filled form</a>',
     )
 
