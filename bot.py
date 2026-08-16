@@ -58,6 +58,30 @@ in by accident, and it's the same phone-first matching the backend already
 uses to find the right roster row. Side (E/I) and name are asked once and
 then reused; name is offered as a guess from their Telegram profile first
 ("We have you as X -- right?") so most people just tap Yes.
+
+FAST-TRACKING SICK-DAY CALL-OUTS (added 8/16/2026)
+----------------------------------------------------
+Feedback: the full question-by-question flow is the right amount of detail
+for a planned, advance-notice absence (coverage planning genuinely needs
+the date range / part-of-day / time specifics) but way too many taps for
+"I'm sick, I'm out today" -- at that point who's-out-and-when is what
+matters, not a six-question form. Three changes address that, all living
+alongside the original flow rather than replacing it:
+
+  1. Split entry point -- once a profile exists, starting a report first
+     asks "Calling out today/tomorrow?" vs "Planning ahead?" (ask_entry_choice).
+     "Planning ahead" is the untouched original flow. "Calling out" is new.
+  2. Shrunk sick-day path -- picking Today/Tomorrow (ask_sick_day) sets
+     one_or_multiple/single_day/part_of_day automatically (single day,
+     full day -- the overwhelmingly common case for a same-day call-out)
+     and skips straight to a quick-reason step (ask_reason_quick: Sick /
+     Family emergency / Car trouble / Other / Skip) then confirmation.
+     Two taps total instead of the full flow.
+  3. Natural-language shortcut -- typing something like "sick today" or
+     "calling out tomorrow" as a plain message (when idle, i.e. no step in
+     progress) is parsed directly by try_quick_absence() into the same
+     single-day/full-day answers and drops straight to the confirm screen.
+     One message, one tap ("Looks good") and it's submitted.
 """
 
 import calendar
@@ -195,7 +219,7 @@ def get_user(chat_id) -> dict:
 
 
 def reset_answers(u: dict) -> None:
-    u["step"] = "one_or_multiple"
+    u["step"] = "entry"
     u["answers"] = {}
     u.pop("_range_start", None)
     u.pop("cal_year", None)
@@ -391,6 +415,67 @@ def ask_name_confirm(chat_id, guess_first, guess_last):
         )
     else:
         send_message(chat_id, "What's your first name?")
+
+
+def ask_entry_choice(chat_id):
+    send_message(
+        chat_id,
+        "What's this for?",
+        kb(
+            [
+                [("🤒 Calling out today/tomorrow", "entry:sick")],
+                [("📅 Planning ahead", "entry:planned")],
+            ]
+        ),
+    )
+
+
+def ask_sick_day(chat_id, u):
+    u["answers"] = {}
+    u.pop("_range_start", None)
+    u["step"] = "sickday"
+    send_message(chat_id, "When?", kb([[("Today", "sickday:today"), ("Tomorrow", "sickday:tomorrow")]]))
+
+
+def ask_reason_quick(chat_id):
+    send_message(
+        chat_id,
+        "Quick reason? (optional)",
+        kb(
+            [
+                [("Sick", "reasonquick:Sick"), ("Family emergency", "reasonquick:Family emergency")],
+                [("Car trouble", "reasonquick:Car trouble"), ("Other", "reasonquick:other")],
+                [("Skip", "reasonquick:")],
+            ]
+        ),
+    )
+
+
+_QUICK_ABSENCE_TRIGGERS = (
+    "sick", "calling out", "call out", "won't be in", "wont be in",
+    "can't come in", "cant come in", "not coming in", "absent",
+)
+
+
+def try_quick_absence(text: str) -> "datetime.date | None":
+    """
+    Parses free-typed messages like "sick today" or "calling out tomorrow"
+    into a date, so a volunteer can skip straight to the confirm screen
+    without touching a single button. Only ever consulted when there's no
+    step in progress (see handle_text) -- it never intercepts an answer to
+    an actual question. See FAST-TRACKING SICK-DAY CALL-OUTS in the module
+    docstring.
+    """
+    t = text.lower()
+    if "tomorrow" in t:
+        day = datetime.date.today() + datetime.timedelta(days=1)
+    elif "today" in t:
+        day = datetime.date.today()
+    else:
+        return None
+    if not any(k in t for k in _QUICK_ABSENCE_TRIGGERS):
+        return None
+    return day
 
 
 def ask_absence_start(chat_id):
@@ -612,7 +697,7 @@ def handle_command(chat_id, u, text, from_user):
     if cmd in ("/start", "/absence"):
         if has_profile(u):
             reset_answers(u)
-            ask_absence_start(chat_id)
+            ask_entry_choice(chat_id)
         else:
             u["step"] = "phone"
             start_profile(chat_id)
@@ -645,7 +730,7 @@ def handle_text(chat_id, u, text, from_user):
     if step == "last_name_typed":
         u["last_name"] = text.strip()
         reset_answers(u)
-        ask_absence_start(chat_id)
+        ask_entry_choice(chat_id)
         return
     if step == "single_day":
         u["answers"]["single_day"] = text.strip()
@@ -678,10 +763,24 @@ def handle_text(chat_id, u, text, from_user):
         ask_confirm(chat_id, u)
         return
 
-    # No step in progress -- treat any message as "let's start."
+    # No step in progress -- treat any message as "let's start." First check
+    # whether it's already enough on its own ("sick today") to skip straight
+    # to the confirm screen; see try_quick_absence().
     if has_profile(u):
+        quick_day = try_quick_absence(text)
+        if quick_day is not None:
+            u["answers"] = {
+                "one_or_multiple": "Just one day",
+                "single_day": _fmt_date(quick_day),
+                "part_of_day": PART_LABELS["full"],
+                "reason": "Sick" if "sick" in text.lower() else "",
+            }
+            u.pop("_range_start", None)
+            u["step"] = "confirm"
+            ask_confirm(chat_id, u)
+            return
         reset_answers(u)
-        ask_absence_start(chat_id)
+        ask_entry_choice(chat_id)
     else:
         u["step"] = "phone"
         start_profile(chat_id)
@@ -715,10 +814,36 @@ def handle_callback(chat_id, u, data, from_user, message_id=None):
             u["first_name"] = u.pop("_guess_first", "")
             u["last_name"] = u.pop("_guess_last", "")
             reset_answers(u)
-            ask_absence_start(chat_id)
+            ask_entry_choice(chat_id)
         else:
             u["step"] = "first_name_typed"
             send_message(chat_id, "No problem -- what's your first name?")
+        return
+
+    if kind == "entry":
+        if value == "sick":
+            ask_sick_day(chat_id, u)
+        else:
+            ask_absence_start(chat_id)
+        return
+
+    if kind == "sickday":
+        day = datetime.date.today() if value == "today" else datetime.date.today() + datetime.timedelta(days=1)
+        u["answers"]["one_or_multiple"] = "Just one day"
+        u["answers"]["single_day"] = _fmt_date(day)
+        u["answers"]["part_of_day"] = PART_LABELS["full"]
+        u["step"] = "reason"
+        ask_reason_quick(chat_id)
+        return
+
+    if kind == "reasonquick":
+        if value == "other":
+            u["step"] = "reason"
+            ask_reason(chat_id)
+        else:
+            u["answers"]["reason"] = value
+            u["step"] = "confirm"
+            ask_confirm(chat_id, u)
         return
 
     if kind == "days":
@@ -813,7 +938,7 @@ def handle_callback(chat_id, u, data, from_user, message_id=None):
                 submit_mode_a(chat_id, u)
         else:
             reset_answers(u)
-            ask_absence_start(chat_id)
+            ask_entry_choice(chat_id)
         return
 
 
