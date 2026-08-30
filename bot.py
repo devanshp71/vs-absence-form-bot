@@ -81,7 +81,7 @@ alongside the original flow rather than replacing it:
      "calling out tomorrow" as a plain message (when idle, i.e. no step in
      progress) is parsed directly by try_quick_absence() into the same
      single-day/full-day answers and drops straight to the confirm screen.
-     One message, one tap ("Looks good") and it's submitted.
+     One message, one tap ("Open form and submit ➜") and it's submitted.
 """
 
 import calendar
@@ -624,7 +624,7 @@ def ask_confirm(chat_id, u):
     send_message(
         chat_id,
         summary_text(u),
-        kb([[("✅ Looks good", "confirm:yes"), ("Start over", "confirm:no")]]),
+        kb([[("Open form and submit ➜", "confirm:yes"), ("Start over", "confirm:no")]]),
     )
 
 
@@ -685,8 +685,9 @@ def submit_mode_a(chat_id, u):
     link = build_prefill_url(u)
     send_message(
         chat_id,
-        "Everything's filled in -- tap below, glance it over, and hit "
-        "<b>Submit</b>. That's it.\n\n"
+        "Almost done -- one last step! Tap the link below, glance over the "
+        "pre-filled form, and hit <b>Submit</b> in the form. It's not sent "
+        "until you do.\n\n"
         f'<a href="{link}">Open the pre-filled form</a>',
     )
 
