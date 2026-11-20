@@ -164,7 +164,14 @@ FIELD_IDS = {
     "part_of_day": "r363582402137452f8505b9ac5e71bd4f",
     "time_text": "r2904d870cd6a40299935fc2abd4c2223",
     "reason": "r6db6981619cf401a97f10c7980a7451b",
+    # v2 (UAT only for now): the "Request type" choice question. Empty here
+    # means the form has no such question, and the bot hides "Call back in".
+    # The UAT environment supplies the id through FIELD_IDS_JSON.
+    "request_type": "",
 }
+
+# Must match the option text on the form exactly.
+REQUEST_CANCEL = "Call back in (cancel my absence)"
 
 # Optional override, e.g. FIELD_IDS_JSON='{"side":"r...","phone":"r..."}'.
 # Only the keys given are replaced; unknown keys are rejected at startup so a
@@ -253,6 +260,7 @@ def get_user(chat_id) -> dict:
 def reset_answers(u: dict) -> None:
     u["step"] = "entry"
     u["answers"] = {}
+    u.pop("_cancel", None)
     u.pop("_range_start", None)
     u.pop("cal_year", None)
     u.pop("cal_month", None)
@@ -487,17 +495,49 @@ def ask_last_name_only(chat_id, guess_first):
     )
 
 
+def cancel_enabled() -> bool:
+    return bool(FIELD_IDS.get("request_type"))
+
+
 def ask_entry_choice(chat_id):
+    rows = [
+        [("🤒 Calling out today/tomorrow", "entry:sick")],
+        [("📅 Planning ahead", "entry:planned")],
+    ]
+    if cancel_enabled():
+        rows.append([("↩️ Call back in -- I can come after all", "entry:cancel")])
+    send_message(chat_id, "What's this for?", kb(rows))
+
+
+def ask_cancel_start(chat_id):
     send_message(
         chat_id,
-        "What's this for?",
-        kb(
-            [
-                [("🤒 Calling out today/tomorrow", "entry:sick")],
-                [("📅 Planning ahead", "entry:planned")],
-            ]
-        ),
+        "Glad you can make it! Which absence are you cancelling -- one day, or multiple days?",
+        kb([[("Just one day", "days:one"), ("Multiple days", "days:multi")]]),
     )
+
+
+def after_single_day(chat_id, u):
+    """Absence: ask part of day. Call back in: whole day, straight to confirm."""
+    if u.get("_cancel"):
+        u["answers"]["part_of_day"] = PART_LABELS["full"]
+        u["answers"]["reason"] = ""
+        u["step"] = "confirm"
+        ask_confirm(chat_id, u)
+    else:
+        u["step"] = "part_of_day"
+        ask_part_of_day(chat_id)
+
+
+def after_dates(chat_id, u):
+    """Absence: ask for a reason. Call back in: no reason needed."""
+    if u.get("_cancel"):
+        u["answers"]["reason"] = ""
+        u["step"] = "confirm"
+        ask_confirm(chat_id, u)
+    else:
+        u["step"] = "reason"
+        ask_reason(chat_id)
 
 
 def ask_sick_day(chat_id, u):
@@ -629,6 +669,13 @@ def summary_text(u: dict) -> str:
     if part == PART_LABELS["after"]:
         part = f"{part} ({a.get('time_text', '')})"
     part_line = f"Part of day: {part}\n" if part else ""
+    if u.get("_cancel"):
+        return (
+            f"<b>Please confirm -- CALL BACK IN</b>\n"
+            f"{u['first_name']} {u['last_name']} · {side_label}\n"
+            f"Cancelling my absence for: {dates}\n\n"
+            f"You'll be marked available again for those dates."
+        )
     reason = a.get("reason") or "(none given)"
     return (
         f"<b>Please confirm</b>\n"
@@ -694,6 +741,8 @@ def build_prefill_url(u: dict) -> str:
         params[FIELD_IDS["last_day"]] = a["last_day"]
     if a.get("reason"):
         params[FIELD_IDS["reason"]] = a["reason"]
+    if u.get("_cancel") and cancel_enabled():
+        params[FIELD_IDS["request_type"]] = _choice(REQUEST_CANCEL)
     # quote_via=quote (not the default quote_plus) is required: this form
     # only recognizes %20 for spaces inside a prefill value, not '+'.
     # Confirmed 8/15/2026 -- a '+'-encoded link left every choice question
@@ -815,8 +864,7 @@ def handle_text(chat_id, u, text, from_user):
         return
     if step == "single_day":
         u["answers"]["single_day"] = text.strip()
-        u["step"] = "part_of_day"
-        ask_part_of_day(chat_id)
+        after_single_day(chat_id, u)
         return
     if step == "first_day":
         u["answers"]["first_day"] = text.strip()
@@ -830,8 +878,7 @@ def handle_text(chat_id, u, text, from_user):
         # matches the form exactly rather than asking something it never would.
         u["answers"]["last_day"] = text.strip()
         u["answers"]["part_of_day"] = ""
-        u["step"] = "reason"
-        ask_reason(chat_id)
+        after_dates(chat_id, u)
         return
     if step == "time_text":
         u["answers"]["time_text"] = text.strip()
@@ -926,6 +973,11 @@ def handle_callback(chat_id, u, data, from_user, message_id=None):
     if kind == "entry":
         if value == "sick":
             ask_sick_day(chat_id, u)
+        elif value == "cancel" and cancel_enabled():
+            u["answers"] = {}
+            u.pop("_range_start", None)
+            u["_cancel"] = True
+            ask_cancel_start(chat_id)
         else:
             ask_absence_start(chat_id)
         return
@@ -982,8 +1034,7 @@ def handle_callback(chat_id, u, data, from_user, message_id=None):
                 u["answers"]["single_day"] = _fmt_date(picked)
                 if message_id:
                     edit_message(chat_id, message_id, f"📅 Away on <b>{_fmt_date(picked)}</b>")
-                u["step"] = "part_of_day"
-                ask_part_of_day(chat_id)
+                after_single_day(chat_id, u)
                 return
             if step == "first_day":
                 u["_range_start"] = picked
@@ -1010,8 +1061,7 @@ def handle_callback(chat_id, u, data, from_user, message_id=None):
                     label = f"{_fmt_date(start)} to {_fmt_date(picked)}" if start else _fmt_date(picked)
                     edit_message(chat_id, message_id, f"📅 Away <b>{label}</b>")
                 u.pop("_range_start", None)
-                u["step"] = "reason"
-                ask_reason(chat_id)
+                after_dates(chat_id, u)
                 return
             return
         return
