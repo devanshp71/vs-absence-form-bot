@@ -88,6 +88,7 @@ import calendar
 import datetime
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -505,14 +506,14 @@ def ask_entry_choice(chat_id):
         [("📅 Planning ahead", "entry:planned")],
     ]
     if cancel_enabled():
-        rows.append([("↩️ Call back in -- I can come after all", "entry:cancel")])
+        rows.append([("↩️ I can come after all", "entry:cancel")])
     send_message(chat_id, "What's this for?", kb(rows))
 
 
 def ask_cancel_start(chat_id):
     send_message(
         chat_id,
-        "Glad you can make it! Which absence are you cancelling -- one day, or multiple days?",
+        "Glad you can make it! Are you coming back in for one day, or multiple days?",
         kb([[("Just one day", "days:one"), ("Multiple days", "days:multi")]]),
     )
 
@@ -601,7 +602,7 @@ def ask_single_day(chat_id, u):
     u["cal_year"], u["cal_month"] = today.year, today.month
     send_message(
         chat_id,
-        "Which day will you be away? Tap a date:",
+        ("Which day are you coming back in for? Tap a date:" if u.get("_cancel") else "Which day will you be away? Tap a date:"),
         build_calendar_kb(today.year, today.month),
     )
 
@@ -612,7 +613,7 @@ def ask_first_day(chat_id, u):
     u.pop("_range_start", None)
     send_message(
         chat_id,
-        "What's the first day you'll be away? Tap a date:",
+        ("What's the first day you're coming back in for? Tap a date:" if u.get("_cancel") else "What's the first day you'll be away? Tap a date:"),
         build_calendar_kb(today.year, today.month),
     )
 
@@ -1033,7 +1034,7 @@ def handle_callback(chat_id, u, data, from_user, message_id=None):
             if step == "single_day":
                 u["answers"]["single_day"] = _fmt_date(picked)
                 if message_id:
-                    edit_message(chat_id, message_id, f"📅 Away on <b>{_fmt_date(picked)}</b>")
+                    edit_message(chat_id, message_id, f"📅 {'Back in' if u.get('_cancel') else 'Away'} on <b>{_fmt_date(picked)}</b>")
                 after_single_day(chat_id, u)
                 return
             if step == "first_day":
@@ -1059,7 +1060,7 @@ def handle_callback(chat_id, u, data, from_user, message_id=None):
                 u["answers"]["part_of_day"] = ""
                 if message_id:
                     label = f"{_fmt_date(start)} to {_fmt_date(picked)}" if start else _fmt_date(picked)
-                    edit_message(chat_id, message_id, f"📅 Away <b>{label}</b>")
+                    edit_message(chat_id, message_id, f"📅 {'Back in' if u.get('_cancel') else 'Away'} <b>{label}</b>")
                 u.pop("_range_start", None)
                 after_dates(chat_id, u)
                 return
@@ -1106,6 +1107,40 @@ def process_update(update: dict):
         save_users()
 
 
+def _collapse_tapped(chat_id, cq: dict) -> None:
+    """Once a button is tapped, replace that message's buttons with the choice.
+
+    Keeps the chat short, and stops an old button being tapped twice (which
+    sent the next question twice). The calendar manages its own message.
+    """
+    try:
+        data = cq.get("data", "")
+        kind = data.partition(":")[0]
+        msg = cq.get("message") or {}
+        message_id = msg.get("message_id")
+        if kind == "cal" or not message_id:
+            return
+        if kind == "confirm":
+            # Keep the summary's formatting; just take the buttons away.
+            edit_markup(chat_id, message_id, {"inline_keyboard": []})
+            return
+        label = ""
+        for row in (msg.get("reply_markup") or {}).get("inline_keyboard", []):
+            for b in row:
+                if b.get("callback_data") == data:
+                    label = b.get("text", "")
+        text = msg.get("text") or ""
+        prefix = f"[{ENV_LABEL}] " if ENV_LABEL else ""
+        if prefix and text.startswith(prefix):
+            text = text[len(prefix):]
+        if not text or not label:
+            edit_markup(chat_id, message_id, {"inline_keyboard": []})
+            return
+        edit_message(chat_id, message_id, f"{html.escape(text)}\n➜ <b>{html.escape(label)}</b>")
+    except Exception:  # never let tidying break the conversation
+        logging.exception("collapse failed")
+
+
 def _dispatch_update(update: dict):
     if "callback_query" in update:
         cq = update["callback_query"]
@@ -1113,6 +1148,7 @@ def _dispatch_update(update: dict):
         message_id = cq["message"].get("message_id")
         u = get_user(chat_id)
         answer_callback(cq["id"])
+        _collapse_tapped(chat_id, cq)
         handle_callback(chat_id, u, cq.get("data", ""), cq.get("from", {}), message_id)
         return
 
