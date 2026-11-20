@@ -122,10 +122,15 @@ API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # The live Microsoft Form. "Enable pre-filled answers" was turned on for
 # this form on 8/15/2026 specifically so Mode A can work -- that is the
 # only setting on the form itself that changed.
-FORM_BASE_URL = (
-    "https://forms.cloud.microsoft/Pages/ResponsePage.aspx?"
-    "id=vYPE0EyNF0uHS9KIombwfqWi2RwnglFNix88qhzOJ1tUMzIzSUZXRkVPVUo2RDFTVEtUVE9DRTBLVi4u"
-)
+#
+# FORM_ID / FIELD_IDS_JSON env vars (UAT support, 11/2026): leave both unset
+# in PROD and the bot behaves exactly as before. The UAT environment sets
+# them to the duplicated UAT form, because a duplicated form gets its own
+# form id and may get new question ids.
+_PROD_FORM_ID = "vYPE0EyNF0uHS9KIombwfqWi2RwnglFNix88qhzOJ1tUMzIzSUZXRkVPVUo2RDFTVEtUVE9DRTBLVi4u"
+FORM_ID = os.environ.get("FORM_ID", "").strip() or _PROD_FORM_ID
+FORM_BASE_URL = "https://forms.cloud.microsoft/Pages/ResponsePage.aspx?id=" + FORM_ID
+ENV_LABEL = os.environ.get("ENV_LABEL", "").strip()  # e.g. "UAT" -> prefixes bot replies
 
 # Confirmed 8/15/2026 two ways: (1) the "Get Pre-filled URL" tool inside
 # Forms, question by question, and (2) a live flow run's raw trigger
@@ -160,6 +165,17 @@ FIELD_IDS = {
     "time_text": "r2904d870cd6a40299935fc2abd4c2223",
     "reason": "r6db6981619cf401a97f10c7980a7451b",
 }
+
+# Optional override, e.g. FIELD_IDS_JSON='{"side":"r...","phone":"r..."}'.
+# Only the keys given are replaced; unknown keys are rejected at startup so a
+# typo can't silently send answers to the wrong question.
+_field_override = os.environ.get("FIELD_IDS_JSON", "").strip()
+if _field_override:
+    _parsed = json.loads(_field_override)
+    _unknown = set(_parsed) - set(FIELD_IDS)
+    if _unknown:
+        raise RuntimeError(f"FIELD_IDS_JSON has unknown keys: {sorted(_unknown)}")
+    FIELD_IDS.update(_parsed)
 
 SIDE_LABELS = {"e": "E-Side (Bhaiyo)", "i": "I-Side (Bheno)"}
 PART_LABELS = {
@@ -309,8 +325,12 @@ def ensure_webhook() -> None:
     logger.info("setWebhook -> %s", result.get("ok"))
 
 
+def _tag(text):
+    return f"<b>[{ENV_LABEL}]</b> {text}" if ENV_LABEL else text
+
+
 def send_message(chat_id, text, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "text": _tag(text), "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     call("sendMessage", payload)
@@ -334,7 +354,7 @@ def edit_message(chat_id, message_id, text, reply_markup=None):
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": text,
+        "text": _tag(text),
         "parse_mode": "HTML",
         "reply_markup": reply_markup if reply_markup is not None else {"inline_keyboard": []},
     }
